@@ -164,7 +164,26 @@ _DEFAULT_UNSAFE_XPATH3_FUNCTIONS = [
 ]
 
 
-def _build_safe_xpath3_parser():
+# XPath 3.1 says the default collation is Unicode codepoint collation. elementpath instead leaves
+# its collation functions pointing at locale.strxfrm / locale.strcoll, so the process-wide
+# LC_COLLATE decides what contains() means:
+#
+#     def contains(self, a, b):  return self.strxfrm(b) in self.strxfrm(a)
+#
+# With LC_COLLATE=C, strxfrm() is the identity and that is an ordinary substring test. With
+# LC_COLLATE=en_US.UTF-8 it returns a binary collation key, and a substring of a collation key is
+# not the collation key of the substring - so contains(), starts-with(), ends-with() and
+# substring-before/after() return false for every input, and a filter that matches 67 elements
+# matches 0 (#4437). Name tests, axes and '=' are unaffected, which is what made it look like the
+# page had changed layout.
+#
+# flask_app.py keeps LC_COLLATE in "C" for this reason, but a filter must not depend on a distant
+# module's locale bookkeeping, nor on what an operator puts in LANG/LC_ALL. Pinning the collation
+# per evaluation makes the filter mean the same thing in every deployment.
+XPATH_CODEPOINT_COLLATION = 'http://www.w3.org/2005/xpath-functions/collation/codepoint'
+
+
+def get_safe_xpath3_parser():
     """Return an XPath3Parser subclass with filesystem/environment access functions removed.
 
     XPath 3.0 includes functions that can read arbitrary files or environment variables:
@@ -195,9 +214,6 @@ def _build_safe_xpath3_parser():
 
     return SafeXPath3Parser
 
-
-# Module-level singleton — built once, reused everywhere.
-SafeXPath3Parser = _build_safe_xpath3_parser()
 
 # Doesn't look like python supports forward slash auto enclosure in re.findall
 # So convert it to inline flag "(?i)foobar" type configuration
@@ -386,7 +402,9 @@ def xpath_filter(xpath_filter, html_content, append_pretty_line_formatting=False
             # This allows //title to match elements in the default namespace
             namespaces[''] = tree.nsmap[None]
 
-        r = elementpath.select(tree, xpath_filter.strip(), namespaces=namespaces, parser=SafeXPath3Parser)
+        r = elementpath.select(tree, xpath_filter.strip(), namespaces=namespaces,
+                               parser=get_safe_xpath3_parser(),
+                               default_collation=XPATH_CODEPOINT_COLLATION)
         #@note: //title/text() now works with default namespaces (fixed by registering '' prefix)
         #@note: //title/text() wont work where <title>CDATA.. (use cdata_in_document_to_text first)
 
@@ -508,11 +526,17 @@ def _has_lone_surrogate(value):
         return any(_has_lone_surrogate(v) for v in value)
     return False
 
+def _sanitize_lone_surrogate_str(value: str) -> str:
+    return _LONE_SURROGATE_RE.sub('\ufffd', value)
+
 def _sanitize_lone_surrogates(value):
     if isinstance(value, str):
-        return _LONE_SURROGATE_RE.sub('\ufffd', value)
+        return _sanitize_lone_surrogate_str(value)
     if isinstance(value, dict):
-        return {_sanitize_lone_surrogates(k): _sanitize_lone_surrogates(v) for k, v in value.items()}
+        # JSON object keys are always strings, so they only need the substitution - recursing on a
+        # key would (in theory) hand back an unhashable dict/list
+        return {_sanitize_lone_surrogate_str(k) if isinstance(k, str) else k: _sanitize_lone_surrogates(v)
+                for k, v in value.items()}
     if isinstance(value, list):
         return [_sanitize_lone_surrogates(v) for v in value]
     return value
